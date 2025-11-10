@@ -5,3 +5,6 @@ start_server.bat
 srt-translate-api*
 start_server.cmd
 start_server_exe.bat
+.DS_Store
+__pycache__
+.ruff_cache
