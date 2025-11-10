@@ -1,0 +1,7 @@
+.venv
+build_exe.bat
+build_exe.py
+start_server.bat
+srt-translate-api*
+start_server.cmd
+start_server_exe.bat

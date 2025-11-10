@@ -1,0 +1,85 @@
+[project]
+name = "srt-translate-api"
+version = "1.0.0"
+description = "SRT字幕翻译API服务 - 基于FastAPI的Web API，提供SRT字幕文件翻译功能"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [
+    {name = "SRT Translate API Team"},
+]
+keywords = ["srt", "subtitle", "translation", "api", "fastapi"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Multimedia :: Video",
+]
+
+dependencies = [
+    "fastapi>=0.104.0,<1.0.0",
+    "uvicorn[standard]>=0.24.0,<1.0.0",
+    "requests>=2.31.0,<3.0.0",
+    "pydantic>=2.0.0,<3.0.0",
+    "urllib3>=2.0.0,<3.0.0",
+    "zai-sdk>=0.0.4.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "httpx>=0.24.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/yourusername/srt-translate-api"
+Documentation = "https://github.com/yourusername/srt-translate-api#readme"
+Repository = "https://github.com/yourusername/srt-translate-api"
+Issues = "https://github.com/yourusername/srt-translate-api/issues"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+only-include = [
+    "api_server.py",
+    "start_server.sh",
+    "start_server.bat",
+    "start_server.cmd",
+    "build_exe.py",
+    "build_exe.bat",
+    "build_exe.sh",
+    "build_app.sh",
+    "test_exe.sh",
+    "test_exe.bat",
+    "srt-translate-api.spec",
+    "srt-translate-api-macos.spec",
+    "srt-translate-api-debug.spec",
+    "README.md",
+]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/api_server.py",
+    "/start_server.*",
+    "/README.md",
+    "/pyproject.toml",
+]
+
+[tool.uv]
+dev-dependencies = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "httpx>=0.24.0",
+    "pyinstaller>=6.0.0",
+]
+
