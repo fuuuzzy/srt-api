@@ -7,13 +7,14 @@ SRT翻译API服务 - FastAPI实现
 import argparse
 import json
 import re
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Callable
 
 import requests
-from fastapi import FastAPI, HTTPException, Depends
-from fastapi.responses import PlainTextResponse
+from fastapi import FastAPI, HTTPException, Depends, Request
+from fastapi.responses import PlainTextResponse, Response
 from pydantic import BaseModel, Field
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -130,7 +131,7 @@ def normalize_lang_code(lang_input: str) -> str:
     return LANG_MAP.get(lang_lower, lang_input.upper())
 
 
-def create_session(use_proxy: bool = True) -> requests.Session:
+def create_session() -> requests.Session:
     """
     创建带重试机制的HTTP会话
 
@@ -467,6 +468,142 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
+
+# 请求和响应日志记录中间件
+@app.middleware("http")
+async def log_requests_responses(request: Request, call_next: Callable) -> Response:
+    """
+    记录所有API请求和响应的中间件
+    """
+    start_time = time.time()
+    
+    # 获取客户端IP
+    client_ip = request.client.host if request.client else "unknown"
+    
+    # 读取请求体（需要保存以便后续使用）
+    request_body = None
+    body_bytes = None
+    if request.method in ["POST", "PUT", "PATCH"]:
+        try:
+            body_bytes = await request.body()
+            if body_bytes:
+                # 尝试解析JSON
+                try:
+                    request_body = json.loads(body_bytes.decode('utf-8'))
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    # 如果不是JSON，记录为文本（截断长内容）
+                    body_text = body_bytes.decode('utf-8', errors='replace')
+                    max_body_length = 1000  # 最大记录长度
+                    if len(body_text) > max_body_length:
+                        request_body = f"{body_text[:max_body_length]}... (已截断，总长度: {len(body_text)} 字符)"
+                    else:
+                        request_body = body_text
+        except Exception as e:
+            request_body = f"<读取请求体失败: {str(e)}>"
+    
+    # 重新设置请求体，以便后续路由处理函数可以使用
+    async def receive():
+        return {"type": "http.request", "body": body_bytes} if body_bytes else {"type": "http.request"}
+    
+    if body_bytes:
+        request._receive = receive
+    
+    # 记录请求信息
+    logger.info("=" * 80)
+    logger.info(f"[请求] {request.method} {request.url.path}")
+    logger.info(f"客户端IP: {client_ip}")
+    logger.info(f"查询参数: {dict(request.query_params)}")
+    
+    # 记录请求头（排除敏感信息）
+    headers_to_log = {}
+    sensitive_headers = ['authorization', 'cookie', 'x-api-key']
+    for key, value in request.headers.items():
+        if key.lower() not in sensitive_headers:
+            headers_to_log[key] = value
+        else:
+            headers_to_log[key] = "***已隐藏***"
+    logger.debug(f"请求头: {json.dumps(headers_to_log, ensure_ascii=False, indent=2)}")
+    
+    # 记录请求体（对于大内容进行截断）
+    if request_body is not None:
+        if isinstance(request_body, dict):
+            # JSON请求体，完整记录
+            request_body_str = json.dumps(request_body, ensure_ascii=False, indent=2)
+            max_length = 2000  # JSON最大记录长度
+            if len(request_body_str) > max_length:
+                logger.info(f"请求体: {request_body_str[:max_length]}... (已截断，总长度: {len(request_body_str)} 字符)")
+            else:
+                logger.info(f"请求体: {request_body_str}")
+        else:
+            # 文本请求体
+            logger.info(f"请求体: {request_body}")
+    
+    # 处理请求
+    try:
+        response = await call_next(request)
+        
+        # 计算处理时间
+        process_time = time.time() - start_time
+        
+        # 记录响应信息
+        status_code = response.status_code
+        
+        # 记录响应基本信息
+        logger.info(f"[响应] 状态码: {status_code}, 处理时间: {process_time:.3f}秒")
+        
+        # 尝试读取响应体（对于大响应进行截断）
+        # 注意：某些响应类型（如 PlainTextResponse）可能无法在中间件中读取响应体
+        # 详细的响应内容会在路由函数中记录
+        try:
+            # 检查响应类型
+            response_type = type(response).__name__
+            logger.debug(f"响应类型: {response_type}")
+            
+            # 对于 JSON 响应，尝试读取响应体
+            if hasattr(response, 'body') and response.body:
+                try:
+                    body_bytes = response.body
+                    if isinstance(body_bytes, bytes):
+                        try:
+                            # 尝试解析JSON
+                            response_body = json.loads(body_bytes.decode('utf-8'))
+                            response_body_str = json.dumps(response_body, ensure_ascii=False, indent=2)
+                            max_length = 2000
+                            if len(response_body_str) > max_length:
+                                logger.info(f"响应体: {response_body_str[:max_length]}... (已截断，总长度: {len(response_body_str)} 字符)")
+                            else:
+                                logger.info(f"响应体: {response_body_str}")
+                        except (json.JSONDecodeError, UnicodeDecodeError):
+                            # 文本响应
+                            body_text = body_bytes.decode('utf-8', errors='replace')
+                            max_length = 2000
+                            if len(body_text) > max_length:
+                                logger.info(f"响应体: {body_text[:max_length]}... (已截断，总长度: {len(body_text)} 字符)")
+                            else:
+                                logger.info(f"响应体: {body_text}")
+                except Exception as e:
+                    logger.debug(f"无法读取响应体: {str(e)}")
+            else:
+                # 对于 PlainTextResponse 等，响应体可能已经在路由函数中记录
+                logger.debug("响应体: <无法在中间件中读取，详情请查看路由函数日志>")
+        except Exception as e:
+            logger.debug(f"读取响应体时出错: {str(e)}")
+        
+        # 对于错误响应，记录为ERROR级别
+        if status_code >= 400:
+            logger.error(f"[错误响应] {request.method} {request.url.path} - 状态码: {status_code}, 处理时间: {process_time:.3f}秒")
+        
+        logger.info("=" * 80)
+        
+        return response
+        
+    except Exception as e:
+        # 处理异常
+        process_time = time.time() - start_time
+        logger.error(f"[异常] {request.method} {request.url.path} - 异常: {str(e)}, 处理时间: {process_time:.3f}秒", exc_info=True)
+        logger.info("=" * 80)
+        raise
 
 
 class TranslateRequest(BaseModel):
