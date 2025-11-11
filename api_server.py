@@ -6,9 +6,7 @@ SRT翻译API服务 - FastAPI实现
 
 import argparse
 import json
-import logging
 import re
-import threading
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Optional, List, Tuple
@@ -21,21 +19,10 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from zai import ZhipuAiClient
 
-# 配置日志
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-logger = logging.getLogger(__name__)
+import logger
+from config import config
 
-# API配置常量
-DEEPLX_API_URL = "http://192.168.1.213:1188/v2/translate"
-ZHIPUAI_API_KEY = ""
-
-# 代理轮询锁
-_proxy_lock = threading.Lock()
-_proxy_index = 0
+logger = logger.get_logger(__name__)
 
 # 语言代码映射
 LANG_MAP = {
@@ -313,9 +300,9 @@ def translate_with_deeplx(
 
     # 调用翻译API
     try:
-        logger.info(f"调用DeepLX翻译API: {DEEPLX_API_URL}")
+        logger.info(f"调用DeepLX翻译API: {config.models['deeplx_api_url']}")
         translated_texts = translate_texts(
-            texts, source_lang_normalized, target_lang_normalized, DEEPLX_API_URL, session
+            texts, source_lang_normalized, target_lang_normalized, config.models['deeplx_api_url'], session
         )
         logger.info(f"翻译完成，收到 {len(translated_texts)} 条翻译结果")
     except Exception as e:
@@ -458,7 +445,7 @@ async def lifespan(app: FastAPI):
 
     # 初始化ZhipuAi客户端
     logger.info("正在初始化ZhipuAi客户端...")
-    _zhipuai_client = ZhipuAiClient(api_key=ZHIPUAI_API_KEY)
+    _zhipuai_client = ZhipuAiClient(api_key=config.models['zhipuai_api_key'])
     logger.info("ZhipuAi客户端初始化完成")
 
     yield

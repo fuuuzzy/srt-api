@@ -1,0 +1,3 @@
+models:
+  deeplx_api_url: http://192.168.1.213:1188/v2/translate
+  zhipuai_api_key: 9f42e657305342958cb05f74c87263bc.p8yaeZqpYnzyDt7d

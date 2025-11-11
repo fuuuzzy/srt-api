@@ -8,3 +8,4 @@ start_server_exe.bat
 .DS_Store
 __pycache__
 .ruff_cache
+logs
