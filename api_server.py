@@ -8,6 +8,7 @@ import argparse
 import json
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Optional, List, Tuple, Callable
@@ -73,6 +74,7 @@ def parse_srt(content: str) -> List[Tuple[int, str, str]]:
         logger.info("检测到非标准换行符，已自动转换")
 
     # 使用非贪婪匹配，直到遇到下一个序号或文件结尾
+    # 匹配格式：序号 \n 时间轴 \n 文本内容（可能包含多行）
     pattern = r"(\d+)\s*\n(\d{2}:\d{2}:\d{2},\d{3}\s*-->\s*\d{2}:\d{2}:\d{2},\d{3})\s*\n(.*?)(?=\n\d+\s*\n|\Z)"
 
     matches = re.findall(pattern, content, re.DOTALL)
@@ -82,16 +84,27 @@ def parse_srt(content: str) -> List[Tuple[int, str, str]]:
     for match in matches:
         index = int(match[0])
         timestamp = match[1]
-        text = match[2].strip()
+        text = match[2]
 
-        # 将多个连续换行符替换为单个换行符，但保留文本内部的换行
-        text = re.sub(r'\n{3,}', '\n\n', text)  # 最多保留两个连续换行
-        text = text.strip()  # 清理首尾空白
+        # 清理文本：移除首尾空白和换行符
+        text = text.strip()
+
+        # 处理文本中的换行符：
+        # 1. 将多个连续换行符（>=3个）压缩为单个换行符（保留文本内部的双换行）
+        # 2. 但保留文本内部的单换行符（用于多行字幕）
+        # 例如："line1\n\nline2" 应该保留为 "line1\nline2"（单换行）
+        # 但 "line1\n\n\nline2" 应该压缩为 "line1\nline2"
+        text = re.sub(r'\n{3,}', '\n', text)  # 3个或更多换行符压缩为1个
+
+        # 清理每行的首尾空白，但保留行之间的换行
+        lines = text.split('\n')
+        cleaned_lines = [line.strip() for line in lines if line.strip()]  # 移除空行
+        text = '\n'.join(cleaned_lines)
 
         subtitles.append((index, timestamp, text))
         # 记录文本行数用于调试
         line_count = text.count('\n') + 1
-        logger.debug(f"解析字幕 {index}: {timestamp} - {line_count}行 - {text[:50].replace(chr(10), ' ')}...")
+        logger.debug(f"解析字幕 {index}: {timestamp} - {line_count}行 - {text[:50].replace(chr(10), ' | ')}...")
 
     return subtitles
 
@@ -170,7 +183,7 @@ _zhipuai_client: Optional[ZhipuAiClient] = None
 def get_translation_session() -> requests.Session:
     """
     依赖注入：获取翻译会话
-    
+
     Returns:
         HTTP会话对象
     """
@@ -182,7 +195,7 @@ def get_translation_session() -> requests.Session:
 def get_zhipuai_client() -> ZhipuAiClient:
     """
     依赖注入：获取ZhipuAi客户端
-    
+
     Returns:
         ZhipuAi客户端对象
     """
@@ -194,10 +207,10 @@ def get_zhipuai_client() -> ZhipuAiClient:
 def normalize_model(model_input: Optional[str]) -> str:
     """
     标准化模型名称
-    
+
     Args:
         model_input: 用户输入的模型名称
-        
+
     Returns:
         标准化的模型名称
     """
@@ -208,40 +221,209 @@ def normalize_model(model_input: Optional[str]) -> str:
     return model
 
 
+def _translate_srt_chunk(
+        chunk_subtitles: List[Tuple[int, str, str]],
+        chunk_index: int,
+        source_lang: str,
+        target_lang: str,
+        client: ZhipuAiClient
+) -> Tuple[int, List[Tuple[int, str, str]]]:
+    """
+    翻译SRT的一个分块
+
+    Args:
+        chunk_subtitles: 该分块的字幕列表 [(序号, 时间轴, 文本), ...]
+        chunk_index: 分块索引（用于日志）
+        source_lang: 源语言
+        target_lang: 目标语言
+        client: ZhipuAi客户端
+
+    Returns:
+        (分块索引, 翻译后的字幕列表)
+    """
+    logger.info(f"开始翻译分块 {chunk_index + 1}，包含 {len(chunk_subtitles)} 条字幕")
+
+    # 将分块格式化为SRT格式
+    chunk_srt = format_srt(chunk_subtitles)
+
+    # 构建翻译提示词
+    prompt = f"""{source_lang} Translate to {target_lang} (output translation only, keep SRT format):
+
+    {chunk_srt}"""
+
+    try:
+        response = client.chat.completions.create(
+            model="glm-4-plus",
+            messages=[
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=4096,
+            temperature=0.7
+        )
+        translated_srt = response.choices[0].message.content.strip()
+
+        # 解析翻译后的SRT
+        translated_subtitles = parse_srt(translated_srt)
+
+        # 确保翻译后的字幕数量与原文一致
+        if len(translated_subtitles) != len(chunk_subtitles):
+            logger.warning(
+                f"分块 {chunk_index + 1} 翻译后字幕数量({len(translated_subtitles)})与原文({len(chunk_subtitles)})不一致，"
+                f"将使用原文的时间轴和序号"
+            )
+            # 如果数量不一致，使用原文的序号和时间轴，只替换文本
+            result = []
+            for i, (orig_index, orig_timestamp, orig_text) in enumerate(chunk_subtitles):
+                if i < len(translated_subtitles):
+                    _, _, translated_text = translated_subtitles[i]
+                    result.append((orig_index, orig_timestamp, translated_text))
+                else:
+                    # 如果翻译结果不足，保留原文
+                    result.append((orig_index, orig_timestamp, orig_text))
+            translated_subtitles = result
+
+        # 确保序号与原文一致（使用原文的序号）
+        result = []
+        for i, (orig_index, orig_timestamp, _) in enumerate(chunk_subtitles):
+            if i < len(translated_subtitles):
+                _, _, translated_text = translated_subtitles[i]
+                result.append((orig_index, orig_timestamp, translated_text))
+            else:
+                # 如果翻译结果不足，保留原文
+                _, _, orig_text = chunk_subtitles[i]
+                result.append((orig_index, orig_timestamp, orig_text))
+
+        logger.info(f"分块 {chunk_index + 1} 翻译完成")
+        return chunk_index, result
+
+    except Exception as e:
+        logger.error(f"分块 {chunk_index + 1} 翻译失败: {str(e)}", exc_info=True)
+        # 翻译失败时，返回原文
+        return chunk_index, chunk_subtitles
+
+
 def translate_with_zhipuai(
         srt_content: str,
         source_lang: str,
         target_lang: str,
-        client: ZhipuAiClient
+        client: ZhipuAiClient,
+        concurrency: int = 10
 ) -> str:
     """
-    使用 ZhipuAi 模型翻译SRT
-    
+    使用 ZhipuAi 模型并发翻译SRT（拆分成多个分块并发翻译）
+
     Args:
         srt_content: SRT字幕内容
         source_lang: 源语言
         target_lang: 目标语言
         client: ZhipuAi客户端
-        
+        concurrency: 并发数量，默认5
+
     Returns:
         翻译后的SRT内容
     """
-    logger.info("使用 ZhipuAi 模型进行翻译")
+    logger.info(f"使用 ZhipuAi 模型进行并发翻译（并发数: {concurrency}）")
 
-    # 构建翻译提示词
-    prompt = f"""{source_lang} Translate to {target_lang} (output translation only):
+    # 解析SRT内容
+    try:
+        logger.info("开始解析SRT内容...")
+        subtitles = parse_srt(srt_content)
+        logger.info(f"SRT解析完成，找到 {len(subtitles)} 条字幕")
+    except Exception as e:
+        logger.error(f"SRT格式解析失败: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"SRT格式解析失败: {str(e)}")
 
-    {srt_content}"""
+    if not subtitles:
+        logger.warning("SRT文件中未找到任何字幕内容")
+        raise HTTPException(status_code=400, detail="SRT文件中未找到任何字幕内容")
 
-    response = client.chat.completions.create(
-        model="glm-4-plus",
-        messages=[
-            {"role": "user", "content": prompt}
-        ],
-        max_tokens=4096,
-        temperature=0.7
-    )
-    translated_srt = response.choices[0].message.content.strip()
+    # 如果字幕数量少于并发数，直接翻译
+    if len(subtitles) <= concurrency:
+        logger.info(f"字幕数量({len(subtitles)})少于并发数({concurrency})，使用单次翻译")
+        chunk_index, translated_subtitles = _translate_srt_chunk(
+            subtitles, 0, source_lang, target_lang, client
+        )
+        return format_srt(translated_subtitles)
+
+    # 将字幕拆分成 concurrency 个分块
+    chunk_size = len(subtitles) // concurrency
+    remainder = len(subtitles) % concurrency
+
+    chunks = []
+    start_index = 0
+
+    for i in range(concurrency):
+        # 最后一个分块包含余数
+        current_chunk_size = chunk_size + (1 if i < remainder else 0)
+        end_index = start_index + current_chunk_size
+        chunk = subtitles[start_index:end_index]
+        chunks.append(chunk)
+        logger.info(f"分块 {i + 1}: 字幕 {start_index + 1}-{end_index} (共 {len(chunk)} 条)")
+        start_index = end_index
+
+    # 并发翻译所有分块
+    logger.info(f"开始并发翻译 {len(chunks)} 个分块...")
+    translated_chunks = {}
+
+    with ThreadPoolExecutor(max_workers=concurrency) as executor:
+        # 提交所有任务
+        future_to_chunk = {
+            executor.submit(
+                _translate_srt_chunk,
+                chunk,
+                i,
+                source_lang,
+                target_lang,
+                client
+            ): i
+            for i, chunk in enumerate(chunks)
+        }
+
+        # 等待所有任务完成
+        completed_count = 0
+        for future in as_completed(future_to_chunk):
+            chunk_index = future_to_chunk[future]
+            completed_count += 1
+            try:
+                result_chunk_index, translated_subtitles = future.result()
+                translated_chunks[result_chunk_index] = translated_subtitles
+                logger.info(f"分块 {result_chunk_index + 1} 完成 ({completed_count}/{len(chunks)})")
+            except Exception as e:
+                logger.error(f"分块 {chunk_index + 1} 执行失败: {str(e)}", exc_info=True)
+                # 失败时使用原文
+                translated_chunks[chunk_index] = chunks[chunk_index]
+
+    # 按原始顺序组装所有翻译结果
+    logger.info("开始组装翻译结果...")
+    all_translated_subtitles = []
+    for i in range(len(chunks)):
+        if i in translated_chunks:
+            all_translated_subtitles.extend(translated_chunks[i])
+        else:
+            # 如果某个分块缺失，使用原文
+            logger.warning(f"分块 {i + 1} 缺失，使用原文")
+            all_translated_subtitles.extend(chunks[i])
+
+    # 验证序号一致性
+    if len(all_translated_subtitles) != len(subtitles):
+        logger.error(
+            f"翻译后字幕数量({len(all_translated_subtitles)})与原文({len(subtitles)})不一致！"
+        )
+        raise RuntimeError("翻译后字幕数量与原文不一致")
+
+    # 验证序号是否连续
+    for i, (index, _, _) in enumerate(all_translated_subtitles):
+        expected_index = subtitles[i][0]
+        if index != expected_index:
+            logger.warning(
+                f"字幕序号不一致: 位置 {i} 期望序号 {expected_index}，实际序号 {index}，已修正"
+            )
+            # 修正序号
+            _, timestamp, text = all_translated_subtitles[i]
+            all_translated_subtitles[i] = (expected_index, timestamp, text)
+
+    logger.info("ZhipuAi 并发翻译完成，开始格式化输出")
+    translated_srt = format_srt(all_translated_subtitles)
     logger.info("ZhipuAi 翻译完成")
     return translated_srt
 
@@ -254,13 +436,13 @@ def translate_with_deeplx(
 ) -> str:
     """
     使用 DeepLX 模型翻译SRT
-    
+
     Args:
         srt_content: SRT字幕内容
         source_lang: 源语言
         target_lang: 目标语言
         session: HTTP会话对象
-        
+
     Returns:
         翻译后的SRT内容
     """
@@ -477,10 +659,10 @@ async def log_requests_responses(request: Request, call_next: Callable) -> Respo
     记录所有API请求和响应的中间件
     """
     start_time = time.time()
-    
+
     # 获取客户端IP
     client_ip = request.client.host if request.client else "unknown"
-    
+
     # 读取请求体（需要保存以便后续使用）
     request_body = None
     body_bytes = None
@@ -501,20 +683,20 @@ async def log_requests_responses(request: Request, call_next: Callable) -> Respo
                         request_body = body_text
         except Exception as e:
             request_body = f"<读取请求体失败: {str(e)}>"
-    
+
     # 重新设置请求体，以便后续路由处理函数可以使用
     async def receive():
         return {"type": "http.request", "body": body_bytes} if body_bytes else {"type": "http.request"}
-    
+
     if body_bytes:
         request._receive = receive
-    
+
     # 记录请求信息
     logger.info("=" * 80)
     logger.info(f"[请求] {request.method} {request.url.path}")
     logger.info(f"客户端IP: {client_ip}")
     logger.info(f"查询参数: {dict(request.query_params)}")
-    
+
     # 记录请求头（排除敏感信息）
     headers_to_log = {}
     sensitive_headers = ['authorization', 'cookie', 'x-api-key']
@@ -524,7 +706,7 @@ async def log_requests_responses(request: Request, call_next: Callable) -> Respo
         else:
             headers_to_log[key] = "***已隐藏***"
     logger.debug(f"请求头: {json.dumps(headers_to_log, ensure_ascii=False, indent=2)}")
-    
+
     # 记录请求体（对于大内容进行截断）
     if request_body is not None:
         if isinstance(request_body, dict):
@@ -538,20 +720,20 @@ async def log_requests_responses(request: Request, call_next: Callable) -> Respo
         else:
             # 文本请求体
             logger.info(f"请求体: {request_body}")
-    
+
     # 处理请求
     try:
         response = await call_next(request)
-        
+
         # 计算处理时间
         process_time = time.time() - start_time
-        
+
         # 记录响应信息
         status_code = response.status_code
-        
+
         # 记录响应基本信息
         logger.info(f"[响应] 状态码: {status_code}, 处理时间: {process_time:.3f}秒")
-        
+
         # 尝试读取响应体（对于大响应进行截断）
         # 注意：某些响应类型（如 PlainTextResponse）可能无法在中间件中读取响应体
         # 详细的响应内容会在路由函数中记录
@@ -559,7 +741,7 @@ async def log_requests_responses(request: Request, call_next: Callable) -> Respo
             # 检查响应类型
             response_type = type(response).__name__
             logger.debug(f"响应类型: {response_type}")
-            
+
             # 对于 JSON 响应，尝试读取响应体
             if hasattr(response, 'body') and response.body:
                 try:
@@ -571,7 +753,8 @@ async def log_requests_responses(request: Request, call_next: Callable) -> Respo
                             response_body_str = json.dumps(response_body, ensure_ascii=False, indent=2)
                             max_length = 2000
                             if len(response_body_str) > max_length:
-                                logger.info(f"响应体: {response_body_str[:max_length]}... (已截断，总长度: {len(response_body_str)} 字符)")
+                                logger.info(
+                                    f"响应体: {response_body_str[:max_length]}... (已截断，总长度: {len(response_body_str)} 字符)")
                             else:
                                 logger.info(f"响应体: {response_body_str}")
                         except (json.JSONDecodeError, UnicodeDecodeError):
@@ -579,7 +762,8 @@ async def log_requests_responses(request: Request, call_next: Callable) -> Respo
                             body_text = body_bytes.decode('utf-8', errors='replace')
                             max_length = 2000
                             if len(body_text) > max_length:
-                                logger.info(f"响应体: {body_text[:max_length]}... (已截断，总长度: {len(body_text)} 字符)")
+                                logger.info(
+                                    f"响应体: {body_text[:max_length]}... (已截断，总长度: {len(body_text)} 字符)")
                             else:
                                 logger.info(f"响应体: {body_text}")
                 except Exception as e:
@@ -589,19 +773,21 @@ async def log_requests_responses(request: Request, call_next: Callable) -> Respo
                 logger.debug("响应体: <无法在中间件中读取，详情请查看路由函数日志>")
         except Exception as e:
             logger.debug(f"读取响应体时出错: {str(e)}")
-        
+
         # 对于错误响应，记录为ERROR级别
         if status_code >= 400:
-            logger.error(f"[错误响应] {request.method} {request.url.path} - 状态码: {status_code}, 处理时间: {process_time:.3f}秒")
-        
+            logger.error(
+                f"[错误响应] {request.method} {request.url.path} - 状态码: {status_code}, 处理时间: {process_time:.3f}秒")
+
         logger.info("=" * 80)
-        
+
         return response
-        
+
     except Exception as e:
         # 处理异常
         process_time = time.time() - start_time
-        logger.error(f"[异常] {request.method} {request.url.path} - 异常: {str(e)}, 处理时间: {process_time:.3f}秒", exc_info=True)
+        logger.error(f"[异常] {request.method} {request.url.path} - 异常: {str(e)}, 处理时间: {process_time:.3f}秒",
+                     exc_info=True)
         logger.info("=" * 80)
         raise
 

@@ -9,3 +9,5 @@ start_server_exe.bat
 __pycache__
 .ruff_cache
 logs
+.idea
+*.iml
