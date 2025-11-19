@@ -75,11 +75,3 @@ include = [
     "/pyproject.toml",
 ]
 
-[tool.uv]
-dev-dependencies = [
-    "pytest>=7.0.0",
-    "pytest-asyncio>=0.21.0",
-    "httpx>=0.24.0",
-    "pyinstaller>=6.0.0",
-]
-
